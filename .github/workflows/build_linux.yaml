@@ -1,0 +1,201 @@
+# This workflow relies on actions/cache to store the hak dependency artifacts as they take a long time to build
+# Due to this extra care must be taken to only ever run all build_* scripts against the same branch to ensure
+# the correct cache scoping, and additional care must be taken to not run untrusted actions on the develop branch.
+on:
+    workflow_call:
+        inputs:
+            arch:
+                type: string
+                required: true
+                description: "The architecture to build for, one of 'amd64' | 'arm64'"
+            version:
+                type: string
+                required: false
+                description: "Version string to override the one in package.json, used for non-release builds"
+            sqlcipher:
+                type: string
+                required: true
+                description: "How to link sqlcipher, one of 'system' | 'static'"
+            blob_report:
+                type: boolean
+                required: false
+                description: "Whether to run the blob report"
+env:
+    SQLCIPHER_BUNDLED: ${{ inputs.sqlcipher == 'static' && '1' || '' }}
+    MAX_GLIBC: 2.31 # bullseye-era glibc, used by glibc-check.sh
+permissions: {} # No permissions required
+jobs:
+    build:
+        # We build on native infrastructure as matrix-seshat fails to cross-compile properly
+        # https://github.com/matrix-org/seshat/issues/135
+        runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+        env:
+            HAK_DOCKER_IMAGE: ghcr.io/element-hq/element-desktop-dockerbuild
+        steps:
+            - name: Resolve docker image tag for push
+              if: github.event_name == 'push'
+              run: echo "HAK_DOCKER_IMAGE=$HAK_DOCKER_IMAGE:$GITHUB_REF_NAME" >> $GITHUB_ENV
+            - name: Resolve docker image tag for release
+              if: github.event_name == 'release'
+              run: echo "HAK_DOCKER_IMAGE=$HAK_DOCKER_IMAGE:staging" >> $GITHUB_ENV
+            - name: Resolve docker image tag for other triggers
+              if: github.event_name != 'push' && github.event_name != 'release'
+              run: echo "HAK_DOCKER_IMAGE=$HAK_DOCKER_IMAGE:develop" >> $GITHUB_ENV
+
+            - uses: nbucic/variable-mapper@0673f6891a0619ba7c002ecfed0f9f4f39017b6f
+              id: config
+              with:
+                  key: "${{ inputs.arch }}"
+                  export_to: output
+                  map: |
+                      {
+                        "amd64": {
+                          "target": "x86_64-unknown-linux-gnu",
+                          "arch": "x86-64"
+                        },
+                        "arm64": {
+                          "target": "aarch64-unknown-linux-gnu",
+                          "arch": "aarch64",
+                          "build-args": "--arm64"
+                        }
+                      }
+
+            - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+            - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+              with:
+                  name: webapp
+
+            - name: Cache .hak
+              id: cache
+              uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+              with:
+                  key: ${{ runner.os }}-${{ github.ref_name }}-${{ inputs.sqlcipher }}-${{ inputs.arch }}-${{ hashFiles('hakHash', 'electronVersion', 'dockerbuild/*') }}
+                  path: |
+                      ./.hak
+
+            - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+              with:
+                  node-version-file: .node-version
+                  cache: "yarn"
+              env:
+                  # Workaround for https://github.com/actions/setup-node/issues/317
+                  FORCE_COLOR: 0
+
+            - name: Install Deps
+              run: "yarn install --frozen-lockfile"
+
+            - name: "Get modified files"
+              id: changed_files
+              if: steps.cache.outputs.cache-hit != 'true' && github.event_name == 'pull_request'
+              uses: tj-actions/changed-files@823fcebdb31bb35fdf2229d9f769b400309430d0 # v46
+              with:
+                  files: |
+                      dockerbuild/**
+
+            # This allows contributors to test changes to the dockerbuild image within a pull request
+            - name: Build docker image
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+              if: steps.changed_files.outputs.any_modified == 'true'
+              with:
+                  file: dockerbuild/Dockerfile
+                  load: true
+                  platforms: linux/${{ inputs.arch }}
+                  tags: ${{ env.HAK_DOCKER_IMAGE }}
+
+            - name: Build Natives
+              if: steps.cache.outputs.cache-hit != 'true'
+              run: |
+                  docker run \
+                    -v ${{ github.workspace }}:/work -w /work \
+                    -e SQLCIPHER_BUNDLED \
+                    $HAK_DOCKER_IMAGE \
+                    yarn build:native
+
+            - name: Fix permissions on .hak
+              run: sudo chown -R $USER:$USER .hak
+
+            - name: Check native libraries in hak dependencies
+              run: |
+                  shopt -s globstar
+
+                  for filename in ./.hak/hakModules/**/*.node; do
+                      ./scripts/glibc-check.sh $filename
+                  done
+
+            - name: Generate debian files and arguments
+              run: |
+                  if [ -f changelog.Debian ]; then
+                      echo "ED_DEBIAN_CHANGELOG=changelog.Debian" >> $GITHUB_ENV
+                  fi
+
+            # Workaround for https://github.com/electron-userland/electron-builder/issues/6116
+            - name: Install fpm
+              if: inputs.arch == 'arm64'
+              run: |
+                  sudo apt-get install ruby-dev build-essential
+                  sudo gem install fpm
+                  echo "USE_SYSTEM_FPM=true" >> $GITHUB_ENV
+
+            - name: Build App
+              run: yarn build --publish never -l ${{ steps.config.outputs.build-args }}
+              env:
+                  # Only set for Nightly builds
+                  ED_NIGHTLY: ${{ inputs.version }}
+
+            - name: Check native libraries
+              run: |
+                  set -x
+                  shopt -s globstar
+
+                  FILES=$(file dist/**/*.node)
+                  echo "$FILES"
+
+                  if [ grep -v "$ARCH" ]; then
+                      exit 1
+                  fi
+
+                  LIBS=$(readelf -d dist/**/*.node | grep NEEDED)
+                  echo "$LIBS"
+
+                  set +x
+                  assert_contains_string() { [[ "$1" == *"$2"* ]]; }
+                  ! assert_contains_string "$LIBS" "libcrypto.so.1.1"
+                  if [ "$SQLCIPHER_BUNDLED" == "1" ]; then
+                      ! assert_contains_string "$LIBS" "libsqlcipher.so.0"
+                  else
+                      assert_contains_string "$LIBS" "libsqlcipher.so.0"
+                  fi
+
+                  ./scripts/glibc-check.sh dist/linux-*unpacked/element-desktop*
+              env:
+                  ARCH: ${{ steps.config.outputs.arch }}
+
+            # We exclude *-unpacked as it loses permissions and the tarball contains it with correct permissions
+            - name: Upload Artifacts
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: linux-${{ inputs.arch }}-sqlcipher-${{ inputs.sqlcipher }}
+                  path: |
+                      dist
+                      !dist/*-unpacked/**
+                  retention-days: 1
+
+            - name: Assert all required files are present
+              run: |
+                  test -f ./dist/element-desktop*$ARCH.deb
+                  test -f ./dist/element-desktop*.tar.gz
+              env:
+                  ARCH: ${{ inputs.arch }}
+
+    test:
+        needs: build
+        uses: ./.github/workflows/build_test.yaml
+        with:
+            artifact: linux-${{ inputs.arch }}-sqlcipher-${{ inputs.sqlcipher }}
+            runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+            executable: /opt/Element*/element-desktop*
+            prepare_cmd: |
+                sudo apt-get -qq update
+                sudo apt install ./dist/*.deb
+            blob_report: ${{ inputs.blob_report }}

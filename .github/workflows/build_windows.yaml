@@ -1,0 +1,231 @@
+# This workflow relies on actions/cache to store the hak dependency artifacts as they take a long time to build
+# Due to this extra care must be taken to only ever run all build_* scripts against the same branch to ensure
+# the correct cache scoping, and additional care must be taken to not run untrusted actions on the develop branch.
+
+# Windows GHA runner by default uses the pwsh shell which breaks codeSigningCert in the workflow
+# We always sign using eSignerCKA to ensure it keeps working, but aside from release & nightlies we use demo credentials
+# which do not yield trusted signatures.
+defaults:
+    run:
+        shell: powershell
+on:
+    workflow_call:
+        secrets:
+            ESIGNER_USER_NAME:
+                required: false
+            ESIGNER_USER_PASSWORD:
+                required: false
+            ESIGNER_USER_TOTP:
+                required: false
+        inputs:
+            arch:
+                type: string
+                required: true
+                description: "The architecture to build for, one of 'x64' | 'ia32' | 'arm64'"
+            version:
+                type: string
+                required: false
+                description: "Version string to override the one in package.json, used for non-release builds"
+            sign:
+                type: string
+                required: false
+                description: "Whether to sign & notarise the build, requires 'packages.element.io' environment"
+            blob_report:
+                type: boolean
+                required: false
+                description: "Whether to run the blob report"
+permissions: {} # No permissions required
+jobs:
+    build:
+        runs-on: windows-2025
+        environment: ${{ inputs.sign && 'packages.element.io' || '' }}
+        env:
+            SIGNTOOL_PATH: "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x86/signtool.exe"
+        steps:
+            - uses: nbucic/variable-mapper@0673f6891a0619ba7c002ecfed0f9f4f39017b6f
+              id: config
+              with:
+                  key: "${{ inputs.arch }}"
+                  export_to: output
+                  map: |
+                      {
+                        "x64": {
+                          "target": "x86_64-pc-windows-msvc"
+                        },
+                        "arm64": {
+                          "target": "aarch64-pc-windows-msvc",
+                          "build-args": "--arm64",
+                          "arch": "amd64_arm64"
+                        },
+                        "ia32": {
+                          "target": "i686-pc-windows-msvc",
+                          "build-args": "--ia32",
+                          "arch": "x86",
+                          "extra_config": "{\"user_notice\": {\"title\": \"Your desktop environment is unsupported.\",\"description\": \"Support for 32-bit Windows installations has ended. Transition to the web or mobile app for continued access.\"}}"
+                        }
+                      }
+
+            - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+            - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+              with:
+                  name: webapp
+
+            - name: Cache .hak
+              id: cache
+              uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+              with:
+                  key: ${{ runner.os }}-${{ inputs.arch }}-${{ hashFiles('hakHash', 'electronVersion') }}
+                  path: |
+                      ./.hak
+
+            # ActiveTCL package on choco is from 2015,
+            # this one is newer but includes more than we need
+            - name: Choco install tclsh
+              if: steps.cache.outputs.cache-hit != 'true'
+              shell: pwsh
+              run: |
+                  choco install -y magicsplat-tcl-tk --no-progress
+                  echo "${HOME}/AppData/Local/Apps/Tcl86/bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+            - name: Choco install NetWide Assembler
+              if: steps.cache.outputs.cache-hit != 'true'
+              shell: pwsh
+              run: |
+                  choco install -y nasm --no-progress
+                  echo "C:/Program Files/NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+            - name: Install Rust
+              if: steps.cache.outputs.cache-hit != 'true'
+              run: |
+                  rustup toolchain install stable --profile minimal --no-self-update
+                  rustup default stable
+                  rustup target add ${{ steps.config.outputs.target }}
+
+            - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+              with:
+                  node-version-file: .node-version
+                  cache: "yarn"
+
+            - name: Install Deps
+              run: "yarn install --frozen-lockfile"
+
+            - name: Insert config snippet
+              if: steps.config.outputs.extra_config != ''
+              shell: bash
+              run: |
+                  mkdir config-edit
+                  yarn asar extract webapp.asar config-edit
+                  cd config-edit
+                  mv config.json old-config.json
+                  echo '${{ steps.config.outputs.extra_config }}' | jq -s '.[0] * .[1]' old-config.json - > config.json
+                  rm old-config.json
+                  cd ..
+                  rm webapp.asar
+                  yarn asar pack config-edit/ webapp.asar
+
+            - name: Set up sqlcipher macros
+              if: steps.cache.outputs.cache-hit != 'true' && contains(inputs.arch, 'arm')
+              shell: pwsh
+              run: |
+                  echo "NCC=${{ github.workspace }}\scripts\cl.bat" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+            - name: Set up build tools
+              if: steps.cache.outputs.cache-hit != 'true'
+              uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+              with:
+                  arch: ${{ steps.config.outputs.arch || inputs.arch }}
+
+            - name: Build Natives
+              if: steps.cache.outputs.cache-hit != 'true'
+              run: |
+                  refreshenv
+                  yarn build:native --target ${{ steps.config.outputs.target }}
+
+            - name: Install and configure eSigner CKA
+              run: |
+                  Set-StrictMode -Version 'Latest'
+
+                  # Download, extract, and rename
+                  Invoke-WebRequest -OutFile eSigner_CKA.zip "$env:ESIGNER_URL"
+                  Expand-Archive -Path eSigner_CKA.zip -DestinationPath .
+                  Get-ChildItem -Path * -Include "*_build_*.exe" | Rename-Item -NewName eSigner_CKA.exe
+
+                  # Install
+                  New-Item -ItemType Directory -Force -Path "$env:INSTALL_DIR"
+                  ./eSigner_CKA.exe /CURRENTUSER /VERYSILENT /SUPPRESSMSGBOXES /DIR="${{ env.INSTALL_DIR }}" | Out-Null
+
+                  # Disable logger
+                  $LogConfig = Get-Content -Path ${{ env.INSTALL_DIR }}/log4net.config
+                  $LogConfig[0] = '<log4net threshold="OFF">'
+                  $LogConfig | Set-Content -Path ${{ env.INSTALL_DIR }}/log4net.config
+
+                  # Configure - default credentials from https://www.ssl.com/guide/esigner-demo-credentials-and-certificates/
+                  ${{ env.INSTALL_DIR }}/eSignerCKATool.exe config `
+                      -mode ${{ vars.ESIGNER_MODE || 'sandbox' }} `
+                      -user "${{ secrets.ESIGNER_USER_NAME || 'esigner_demo' }}" `
+                      -pass "${{ secrets.ESIGNER_USER_PASSWORD || 'esignerDemo#1' }}" `
+                      -totp "${{ secrets.ESIGNER_USER_TOTP || 'RDXYgV9qju+6/7GnMf1vCbKexXVJmUVr+86Wq/8aIGg=' }}" `
+                      -key "${{ env.MASTER_KEY_FILE }}" -r
+                  ${{ env.INSTALL_DIR }}/eSignerCKATool.exe unload
+                  ${{ env.INSTALL_DIR }}/eSignerCKATool.exe load
+
+                  # Find certificate
+                  $CodeSigningCert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Select-Object -First 1
+                  echo Certificate: $CodeSigningCert
+
+                  # Extract thumbprint and subject name
+                  $Thumbprint = $CodeSigningCert.Thumbprint
+                  $SubjectName = ($CodeSigningCert.Subject -replace ", ?", "`n" | ConvertFrom-StringData).CN
+
+                  echo "ED_SIGNTOOL_THUMBPRINT=$Thumbprint" >> $env:GITHUB_ENV
+                  echo "ED_SIGNTOOL_SUBJECT_NAME=$SubjectName" >> $env:GITHUB_ENV
+              env:
+                  ESIGNER_URL: https://github.com/SSLcom/eSignerCKA/releases/download/v1.0.6/SSL.COM-eSigner-CKA_1.0.6.zip
+                  INSTALL_DIR: C:\Users\runneradmin\eSignerCKA
+                  MASTER_KEY_FILE: C:\Users\runneradmin\eSignerCKA\master.key
+
+            - name: Build App
+              run: yarn build --publish never -w ${{ steps.config.outputs.build-args }}
+              env:
+                  # Only set for Nightly builds
+                  ED_NIGHTLY: ${{ inputs.version }}
+
+            - name: Trust eSigner sandbox cert
+              if: inputs.sign == ''
+              run: |
+                  Set-StrictMode -Version 'Latest'
+                  Import-Certificate -CertStoreLocation Cert:\LocalMachine\Root -FilePath .github/SSLcom-sandbox.crt
+
+            - name: Check app was signed successfully
+              run: |
+                  Set-StrictMode -Version 'Latest'
+                  Get-ChildItem `
+                      -Recurse dist `
+                      -Include *.exe, *.msi `
+                  | ForEach-Object -Process {. $env:SIGNTOOL_PATH verify /pa $_.FullName; if(!$?) { throw }}
+
+            - name: Upload Artifacts
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: win-${{ inputs.arch }}
+                  path: |
+                      dist
+                  retention-days: 1
+
+            - name: Assert all required files are present
+              run: |
+                  Test-Path './dist/win-*unpacked/Element*.exe'
+                  Test-Path './dist/squirrel-windows*/Element Setup*.exe'
+                  Test-Path './dist/squirrel-windows*/element-desktop-*-full.nupkg'
+                  Test-Path './dist/squirrel-windows*/RELEASES'
+                  Test-Path './dist/Element*.msi'
+
+    test:
+        needs: build
+        uses: ./.github/workflows/build_test.yaml
+        with:
+            artifact: win-${{ inputs.arch }}
+            runs-on: ${{ inputs.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
+            executable: ./dist/win*-unpacked/Element*.exe
+            blob_report: ${{ inputs.blob_report }}
