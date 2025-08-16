@@ -139,6 +139,7 @@ const config: Omit<Writable<Configuration>, "electronFuses"> & {
         icon: "build/icons/icon.icns",
         mergeASARs: true,
         x64ArchFiles: "**/matrix-seshat/*.node", // hak already runs lipo
+        identity: null as any,
     },
     win: {
         target: ["squirrel", "msi"],
