@@ -78,13 +78,24 @@ export async function start(updateBaseUrl: string): Promise<void> {
         let url: string;
         let serverType: "json" | undefined;
 
+        // Detect GitHub Releases "latest/download" style base URL
+        const isGithubReleasesBase = /github\.com\/.+\/releases\/.*\/download\/?$/i.test(updateBaseUrl);
+
         if (process.platform === "darwin") {
-            // On macOS it takes a JSON file with a map between versions and their URLs
-            url = `${updateBaseUrl}macos/releases.json`;
+            // macOS uses a JSON file mapping versions to their URLs
+            // For GitHub Releases, the JSON should be uploaded as an asset named 'releases.json'
+            // at the root of the Release "latest/download" path
+            url = isGithubReleasesBase
+                ? `${updateBaseUrl}releases.json`
+                : `${updateBaseUrl}macos/releases.json`;
             serverType = "json";
         } else if (process.platform === "win32") {
-            // On windows it takes a base path and looks for files under that path.
-            url = `${updateBaseUrl}win32/${process.arch}/`;
+            // Windows looks for Squirrel artifacts under the base path
+            // For GitHub Releases, artifacts (RELEASES, .nupkg) are at the root of the
+            // "latest/download" path, so use the base directly.
+            url = isGithubReleasesBase
+                ? updateBaseUrl
+                : `${updateBaseUrl}win32/${process.arch}/`;
         } else {
             // Squirrel / electron only supports auto-update on these two platforms.
             // I'm not even going to try to guess which feed style they'd use if they
@@ -170,3 +181,28 @@ autoUpdater.on("update-downloaded", (ev, releaseNotes, releaseName, releaseDate,
     latestUpdateDownloaded = { releaseNotes, releaseName, releaseDate, updateURL };
     global.mainWindow?.webContents.send("update-downloaded", latestUpdateDownloaded);
 });
+
+// Progress updates while downloading updates (Windows/macOS)
+// Provides percent, bytesPerSecond, transferred and total
+// Not all autoUpdater implementations expose typed 'download-progress'.
+// Use a safe cast and optional fields to avoid type errors.
+(autoUpdater as unknown as { on: (ev: string, cb: (arg: any) => void) => void }).on(
+    "download-progress",
+    (progress: {
+        percent?: number;
+        bytesPerSecond?: number;
+        transferred?: number;
+        total?: number;
+    }) => {
+        try {
+            global.mainWindow?.webContents.send("update-progress", {
+                percent: progress?.percent,
+                bytesPerSecond: progress?.bytesPerSecond,
+                transferred: progress?.transferred,
+                total: progress?.total,
+            });
+        } catch (e) {
+            console.warn("Failed to send update progress", e);
+        }
+    },
+);
