@@ -140,6 +140,7 @@ const config: Omit<Writable<Configuration>, "electronFuses"> & {
         mergeASARs: true,
         x64ArchFiles: "**/matrix-seshat/*.node", // hak already runs lipo
         identity: null as any,
+        target: ["zip", "dmg"], // Thêm zip target cho auto update
     },
     win: {
         target: ["squirrel", "msi"],
